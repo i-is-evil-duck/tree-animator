@@ -5,10 +5,11 @@
 -- THREE LEVELS:
 -- 1. Active 3D       - Animated trees
 -- 2. Inactive 3D     - Static 3D trees
--- 3. Inactive 2D     - Billboard tree images
+-- 3. Inactive 2D     - Orange mesh-plane impostors
 --
--- Random billboard variant is selected once per tree.
--- All LOD and visibility changes are client-side.
+-- No BillboardGui code is used.
+-- The replacement plane faces the camera and matches the
+-- original tree's measured width and height.
 --==============================================================
 
 --==============================================================
@@ -35,26 +36,6 @@ local TREE_ANIMATIONS = {
 }
 
 --==============================================================
--- BILLBOARD IMAGE VARIANTS
---==============================================================
-
-local BILLBOARD_IMAGES = {
-
-	Tree1 = {
-		"rbxassetid://972747577",
-	},
-
-	Tree3 = {
-		"rbxassetid://972747577",
-	},
-
-	Tree4 = {
-		"rbxassetid://972747577",
-	},
-
-}
-
---==============================================================
 -- ANIMATION SETTINGS
 --==============================================================
 
@@ -74,34 +55,39 @@ local CLUSTER_SIZE = 90
 
 local ACTIVE_RADIUS = 200
 
-local BILLBOARD_DISTANCE = 400
+local PLANE_DISTANCE = 400
 
-local BILLBOARD_RETURN_DISTANCE = 360
+local PLANE_RETURN_DISTANCE = 360
 
 local CHECK_INTERVAL = 0.5
 
 local DISCOVERY_INTERVAL = 2
 
 --==============================================================
--- BILLBOARD SETTINGS
+-- MESH PLANE IMPOSTOR SETTINGS
+--
+-- For now, the script creates an orange plane.
+--
+-- Later, put your Blender-created MeshPart in:
+-- ReplicatedStorage > TreeImpostorPlane
+--
+-- The MeshPart should be upright, with:
+-- Local X = width
+-- Local Y = height
+--
+-- The script will resize it to match each tree.
 --==============================================================
 
-local BILLBOARD_ASPECT_RATIO = 0.55
+local PLANE_TEMPLATE_NAME = "TreeImpostorPlane"
 
--- BillboardGui MaxDistance = 0 means unlimited.
-local BILLBOARD_MAX_DISTANCE = 0
+-- nil means use the measured width of each tree.
+local PLANE_ASPECT_RATIO = nil
 
--- Optional orange glow behind each billboard image.
-local BILLBOARD_GLOW_ENABLED = true
-local BILLBOARD_GLOW_COLOR = Color3.fromRGB(255, 170, 60)
-local BILLBOARD_GLOW_TRANSPARENCY = 0.45
-local BILLBOARD_GLOW_SCALE = 1.25
+local PLANE_THICKNESS = 0.05
 
--- Tall orange marker makes billboard LOD placement easy to debug.
-local BILLBOARD_DEBUG_MARKER_ENABLED = true
-local BILLBOARD_DEBUG_MARKER_HEIGHT = 100
-
--- Billboards use world-space sizing (studs), never screen pixels.
+-- Orange tree-height debug markers are toggled with K.
+local PLANE_DEBUG_MARKER_ENABLED = true
+local PLANE_MARKERS_VISIBLE = false
 
 --==============================================================
 -- CAMERA CULLING
@@ -128,10 +114,7 @@ local DEBUG_FIRST_ANIMATION = true
 -- Debug HUD settings.
 local DEBUG_UI_ENABLED = true
 local DEBUG_UI_DEFAULT_VISIBLE = true
-
--- Press semicolon (;) to toggle the HUD.
 local DEBUG_UI_TOGGLE_KEY = Enum.KeyCode.Semicolon
-
 local DEBUG_UI_UPDATE_INTERVAL = 0.5
 
 --==============================================================
@@ -139,6 +122,9 @@ local DEBUG_UI_UPDATE_INTERVAL = 0.5
 --==============================================================
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -149,20 +135,19 @@ local TreesFolder = workspace:WaitForChild("Trees")
 --==============================================================
 
 local ManagedTrees = {}
-
 local Clusters = {}
-
 local ClusterStates = {}
-
 local PendingTrees = {}
 
 local DebugParts = {}
+local ClusterVisualizationEnabled = true
+
+local ActivePlanes = {}
 
 local LODLocked = false
 local LockedClusterStates = {}
 
 local Running = true
-
 local firstAnimationReported = false
 
 local LastStats = {
@@ -173,23 +158,26 @@ local LastStats = {
 
 	ActiveClusters = 0,
 	Inactive3DClusters = 0,
-	BillboardClusters = 0,
+	PlaneClusters = 0,
 
 	PausedTrees = 0,
-	BillboardTrees = 0,
-	BillboardFallbacks = 0,
-	BillboardFailures = 0,
+	PlaneTrees = 0,
+	PlaneFallbacks = 0,
+	PlaneFailures = 0,
+
 	Candidates = 0,
 	MissingRoot = 0,
 	Pending = 0,
 
 }
 
-local BillboardFailureCount = 0
+local PlaneFailureCount = 0
+
 local DebugUI = nil
 local DebugPanel = nil
 local DebugToggleButton = nil
 local DebugLabels = {}
+
 local DebugUIVisible = DEBUG_UI_DEFAULT_VISIBLE
 local LastDebugUIUpdate = 0
 
@@ -204,14 +192,19 @@ local function createDebugLabel(parent, name, y, height, text, textSize, color)
 	label.Name = name
 	label.BackgroundTransparency = 1
 	label.BorderSizePixel = 0
+
 	label.Position = UDim2.fromOffset(10, y)
 	label.Size = UDim2.new(1, -20, 0, height)
+
 	label.Font = Enum.Font.Code
 	label.Text = text
+
 	label.TextColor3 = color or Color3.fromRGB(225, 235, 245)
 	label.TextSize = textSize or 13
+
 	label.TextXAlignment = Enum.TextXAlignment.Left
 	label.TextYAlignment = Enum.TextYAlignment.Center
+
 	label.Parent = parent
 
 	return label
@@ -252,6 +245,7 @@ local function createDebugUI()
 	screenGui.ResetOnSpawn = false
 	screenGui.IgnoreGuiInset = false
 	screenGui.DisplayOrder = 20
+
 	screenGui.Parent = playerGui
 
 	DebugUI = screenGui
@@ -261,12 +255,15 @@ local function createDebugUI()
 	toggle.Name = "ToggleButton"
 	toggle.Position = UDim2.fromOffset(10, 8)
 	toggle.Size = UDim2.fromOffset(170, 28)
+
 	toggle.BackgroundColor3 = Color3.fromRGB(28, 35, 45)
 	toggle.BackgroundTransparency = 0.08
 	toggle.BorderSizePixel = 0
+
 	toggle.Font = Enum.Font.Code
 	toggle.TextColor3 = Color3.fromRGB(255, 255, 255)
 	toggle.TextSize = 12
+
 	toggle.Parent = screenGui
 
 	local toggleCorner = Instance.new("UICorner")
@@ -284,9 +281,11 @@ local function createDebugUI()
 	panel.Name = "StatsPanel"
 	panel.Position = UDim2.fromOffset(10, 42)
 	panel.Size = UDim2.fromOffset(310, 310)
+
 	panel.BackgroundColor3 = Color3.fromRGB(15, 20, 28)
 	panel.BackgroundTransparency = 0.12
 	panel.BorderSizePixel = 0
+
 	panel.Parent = screenGui
 
 	local panelCorner = Instance.new("UICorner")
@@ -309,8 +308,10 @@ local function createDebugUI()
 
 	divider.Position = UDim2.fromOffset(10, 32)
 	divider.Size = UDim2.new(1, -20, 0, 1)
+
 	divider.BackgroundColor3 = Color3.fromRGB(75, 90, 105)
 	divider.BorderSizePixel = 0
+
 	divider.Parent = panel
 
 	local rows = {
@@ -319,11 +320,11 @@ local function createDebugUI()
 		{"Discovery", "Pending: 0 | Missing RootPart: 0"},
 		{"ActiveTrees", "Active trees: 0 | Playing: 0"},
 		{"Paused", "Camera-paused animations: 0"},
-		{"Clusters", "Active: 0 | Static 3D: 0 | Billboard: 0"},
-		{"Billboards", "Working billboards: 0 | Fallbacks: 0"},
-		{"Failures", "Billboard creation failures: 0"},
-		{"Distance", "Active: 0-200 | Billboard: 400+"},
-		{"ToggleHelp", ";: HUD | L: lock/unlock cluster LOD"},
+		{"Clusters", "Active: 0 | Static 3D: 0 | Plane LOD: 0"},
+		{"Planes", "Mesh planes: 0 | Fallbacks: 0"},
+		{"Failures", "Mesh plane failures: 0"},
+		{"Distance", "Active: 0-200 | Plane: 400+"},
+		{"ToggleHelp", ";: HUD | ': clusters | K: markers | L: lock"},
 
 	}
 
@@ -385,39 +386,41 @@ local function updateDebugUI(force)
 	)
 
 	DebugLabels.Clusters.Text = string.format(
-		"Active: %d | Static 3D: %d | Billboard: %d",
+		"Active: %d | Static 3D: %d | Plane LOD: %d",
 		LastStats.ActiveClusters,
 		LastStats.Inactive3DClusters,
-		LastStats.BillboardClusters
+		LastStats.PlaneClusters
 	)
 
-	DebugLabels.Billboards.Text = string.format(
-		"Working billboards: %d | Fallbacks: %d",
-		LastStats.BillboardTrees,
-		LastStats.BillboardFallbacks
+	DebugLabels.Planes.Text = string.format(
+		"Mesh planes: %d | Fallbacks: %d",
+		LastStats.PlaneTrees,
+		LastStats.PlaneFallbacks
 	)
 
 	DebugLabels.Failures.Text = string.format(
-		"Billboard creation failures: %d",
-		LastStats.BillboardFailures
+		"Mesh plane failures: %d",
+		LastStats.PlaneFailures
 	)
 
 	DebugLabels.Distance.Text = string.format(
-		"Active: 0-%d | Billboard: %d+ (return %d)",
+		"Active: 0-%d | Plane: %d+ (return %d)",
 		ACTIVE_RADIUS,
-		BILLBOARD_DISTANCE,
-		BILLBOARD_RETURN_DISTANCE
+		PLANE_DISTANCE,
+		PLANE_RETURN_DISTANCE
 	)
 
 end
 
 createDebugUI()
 
---==============================================================
--- INPUT CONTROLS
---==============================================================
+local clearDebugClusters
+local createPlaneDebugMarker
+local removePlaneDebugMarker
 
-local UserInputService = game:GetService("UserInputService")
+--==============================================================
+-- KEYBOARD CONTROLS
+--==============================================================
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 
@@ -425,7 +428,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		return
 	end
 
-	-- L toggles cluster LOD lock.
+	-- L locks/unlocks the current cluster LOD states.
 	if input.KeyCode == Enum.KeyCode.L then
 
 		LODLocked = not LODLocked
@@ -452,11 +455,51 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 
 	end
 
-	-- Semicolon toggles debug HUD.
+	-- Apostrophe toggles cluster visualization.
+	if input.KeyCode == Enum.KeyCode.Quote then
+
+		ClusterVisualizationEnabled = not ClusterVisualizationEnabled
+
+		if not ClusterVisualizationEnabled then
+			clearDebugClusters()
+		end
+
+		print(
+			"[TreeLOD] Cluster visualization:",
+			ClusterVisualizationEnabled and "ON" or "OFF"
+		)
+
+		return
+
+	end
+
+	-- K toggles orange tree-height markers.
+	if input.KeyCode == Enum.KeyCode.K then
+
+		PLANE_MARKERS_VISIBLE = not PLANE_MARKERS_VISIBLE
+
+		for _, data in pairs(ManagedTrees) do
+
+			if PLANE_MARKERS_VISIBLE and data.LOD == "Inactive2D" then
+				createPlaneDebugMarker(data)
+			elseif not PLANE_MARKERS_VISIBLE then
+				removePlaneDebugMarker(data)
+			end
+
+		end
+
+		print(
+			"[TreeLOD] Plane markers:",
+			PLANE_MARKERS_VISIBLE and "ON" or "OFF"
+		)
+
+		return
+
+	end
+
+	-- Semicolon toggles the debug HUD.
 	if DEBUG_UI_ENABLED and input.KeyCode == DEBUG_UI_TOGGLE_KEY then
-
 		setDebugUIVisible(not DebugUIVisible)
-
 	end
 
 end)
@@ -468,7 +511,6 @@ end)
 local function getClusterCoordinates(position)
 
 	local x = math.floor(position.X / CLUSTER_SIZE)
-
 	local z = math.floor(position.Z / CLUSTER_SIZE)
 
 	return x, z
@@ -486,7 +528,6 @@ local function getClusterCenter(key)
 	local split = string.split(key, "_")
 
 	local x = tonumber(split[1])
-
 	local z = tonumber(split[2])
 
 	if not x or not z then
@@ -506,7 +547,6 @@ local function getClusterDistance(key, position)
 	local center = getClusterCenter(key)
 
 	local dx = center.X - position.X
-
 	local dz = center.Z - position.Z
 
 	return math.sqrt(dx * dx + dz * dz)
@@ -560,8 +600,7 @@ local function isClusterOnScreen(key)
 		center.Z
 	)
 
-	local screenPosition =
-		camera:WorldToViewportPoint(worldCenter)
+	local screenPosition = camera:WorldToViewportPoint(worldCenter)
 
 	local depth = screenPosition.Z
 
@@ -584,8 +623,7 @@ local function isClusterOnScreen(key)
 		(focalLength * clusterRadius)
 		/ math.max(depth - clusterRadius, 1)
 
-	local margin =
-		CAMERA_SCREEN_MARGIN + projectedRadius
+	local margin = CAMERA_SCREEN_MARGIN + projectedRadius
 
 	return
 		screenPosition.X >= -margin
@@ -612,22 +650,6 @@ local function isActualTree(obj)
 	local root = obj:FindFirstChild("RootPart")
 
 	return root ~= nil and root:IsA("BasePart")
-
-end
-
---==============================================================
--- RANDOM BILLBOARD SELECTION
---==============================================================
-
-local function chooseBillboardImage(treeType)
-
-	local options = BILLBOARD_IMAGES[treeType]
-
-	if not options or #options == 0 then
-		return "rbxassetid://972747577"
-	end
-
-	return options[math.random(1, #options)]
 
 end
 
@@ -659,139 +681,175 @@ local function setTree3DVisible(data, visible)
 end
 
 --==============================================================
--- CREATE BILLBOARD
+-- CREATE MESH PLANE IMPOSTOR
 --==============================================================
 
-local function createBillboard(data)
+local PlaneTemplate = ReplicatedStorage:FindFirstChild(PLANE_TEMPLATE_NAME)
 
-	-- Reuse only a billboard that is still parented to this tree and has
-	-- the correct Adornee. Rebuild stale or externally removed instances.
-	if data.Billboard then
+if PlaneTemplate and not PlaneTemplate:IsA("BasePart") then
 
-		if data.Billboard.Parent == data.Model and data.Billboard.Adornee == data.RootPart then
-			return data.Billboard
-		end
-
-		pcall(function()
-			data.Billboard:Destroy()
-		end)
-
-		data.Billboard = nil
-
-	end
-
-	if not data.Model or not data.Model.Parent then
-		return nil
-	end
-
-	if not data.RootPart or not data.RootPart.Parent then
-		return nil
-	end
-
-	if not data.BillboardImage then
-		return nil
-	end
-
-	local billboard = Instance.new("BillboardGui")
-
-	billboard.Name = "TreeLOD_Billboard"
-
-	billboard.Adornee = data.RootPart
-
-	billboard.AlwaysOnTop = false
-
-	billboard.LightInfluence = 0
-
-	billboard.MaxDistance = BILLBOARD_MAX_DISTANCE
-
-	-- World-space dimensions in studs.
-	-- Every billboard uses the height of the tree it replaces.
-	local billboardWidth = data.TreeHeight * BILLBOARD_ASPECT_RATIO
-
-	billboard.Size = UDim2.fromScale(
-		billboardWidth,
-		data.TreeHeight
+	warn(
+		"[TreeLOD] ReplicatedStorage/"
+			.. PLANE_TEMPLATE_NAME
+			.. " must be a BasePart or MeshPart. Using an orange Part placeholder instead."
 	)
 
-	-- Align billboard bottom with the original tree's base.
-	billboard.StudsOffset = Vector3.new(
-		0,
-		data.TreeBottomOffset,
-		0
-	)
+	PlaneTemplate = nil
 
-	billboard.Enabled = false
+end
 
-	-- Orange glow behind the image.
-	if BILLBOARD_GLOW_ENABLED then
+local function createTreePlane(data)
 
-		local glow = Instance.new("ImageLabel")
+	if data.Plane and data.Plane.Parent then
+		return data.Plane
+	end
 
-		glow.Name = "TreeGlow"
-		glow.BackgroundTransparency = 1
-		glow.BorderSizePixel = 0
-		glow.Size = UDim2.fromScale(
-			BILLBOARD_GLOW_SCALE,
-			BILLBOARD_GLOW_SCALE
-		)
+	if not data.Model
+		or not data.Model.Parent
+		or not data.RootPart
+		or not data.RootPart.Parent then
 
-		glow.Position = UDim2.fromScale(
-			(1 - BILLBOARD_GLOW_SCALE) / 2,
-			(1 - BILLBOARD_GLOW_SCALE) / 2
-		)
-
-		glow.Image = data.BillboardImage
-		glow.ImageColor3 = BILLBOARD_GLOW_COLOR
-		glow.ImageTransparency = BILLBOARD_GLOW_TRANSPARENCY
-		glow.ScaleType = Enum.ScaleType.Fit
-		glow.ZIndex = 1
-		glow.Parent = billboard
+		return nil
 
 	end
 
-	local image = Instance.new("ImageLabel")
+	-- Use the Blender MeshPart template when present.
+	-- Otherwise create an orange Part placeholder.
+	local plane
 
-	image.Name = "TreeImage"
+	if PlaneTemplate and PlaneTemplate.Parent then
 
-	image.BackgroundTransparency = 1
+		plane = PlaneTemplate:Clone()
 
-	image.BorderSizePixel = 0
+	else
 
-	image.Size = UDim2.fromScale(1, 1)
+		plane = Instance.new("Part")
+		plane.Shape = Enum.PartType.Block
 
-	image.Position = UDim2.fromScale(0, 0)
+	end
 
-	image.Image = data.BillboardImage
+	plane.Name = "TreeLOD_MeshPlane"
 
-	image.ScaleType = Enum.ScaleType.Fit
+	plane.Anchored = true
 
-	image.ZIndex = 2
+	plane.CanCollide = false
+	plane.CanTouch = false
+	plane.CanQuery = false
 
-	image.Parent = billboard
+	plane.CastShadow = false
+	plane.Massless = true
 
-	billboard.Parent = data.Model
+	-- Match the tree's measured width and height.
+	local planeWidth = data.TreeWidth
 
-	data.Billboard = billboard
+	if PLANE_ASPECT_RATIO and PLANE_ASPECT_RATIO > 0 then
+		planeWidth = data.TreeHeight * PLANE_ASPECT_RATIO
+	end
 
-	return billboard
+	plane.Size = Vector3.new(
+		math.max(planeWidth, 0.1),
+		math.max(data.TreeHeight, 0.1),
+		PLANE_THICKNESS
+	)
+
+	-- Orange placeholder appearance.
+	plane.Color = Color3.fromRGB(255, 140, 35)
+	plane.Material = Enum.Material.Neon
+	plane.Transparency = 0
+
+	plane.Parent = workspace
+
+	data.Plane = plane
+	ActivePlanes[data] = true
+
+	return plane
+
+end
+
+local function removeTreePlane(data)
+
+	ActivePlanes[data] = nil
+
+	if data.Plane then
+		data.Plane:Destroy()
+		data.Plane = nil
+	end
 
 end
 
 --==============================================================
--- BILLBOARD SIZE
---
--- No distance-based resizing is needed. Each BillboardGui is assigned
--- its tree's measured height in studs when it is created.
+-- MESH PLANE POSITION + PLAYER-FACING ROTATION
 --==============================================================
 
---==============================================================
--- BILLBOARD DEBUG MARKER
---==============================================================
+local function updateTreePlanes()
 
-local function createBillboardDebugMarker(data)
+	local camera = workspace.CurrentCamera
 
-	if not BILLBOARD_DEBUG_MARKER_ENABLED or data.BillboardDebugMarker then
+	if not camera then
 		return
+	end
+
+	local cameraPosition = camera.CFrame.Position
+
+	for data in pairs(ActivePlanes) do
+
+		local plane = data.Plane
+
+		if not plane
+			or not plane.Parent
+			or not data.RootPart
+			or not data.RootPart.Parent then
+
+			ActivePlanes[data] = nil
+			continue
+
+		end
+
+		-- Keep the plane centered on the original tree's bounding box.
+		local center = data.RootPart.Position + Vector3.new(
+			0,
+			data.TreeBottomOffset + (data.TreeHeight / 2),
+			0
+		)
+
+		-- Rotate horizontally toward the camera.
+		-- The plane remains upright and only changes its Y rotation.
+		local direction = Vector3.new(
+			cameraPosition.X - center.X,
+			0,
+			cameraPosition.Z - center.Z
+		)
+
+		if direction.Magnitude < 0.001 then
+			direction = Vector3.new(0, 0, -1)
+		end
+
+		plane.CFrame = CFrame.lookAt(
+			center,
+			center + direction.Unit
+		)
+
+	end
+
+end
+
+RunService.RenderStepped:Connect(updateTreePlanes)
+
+--==============================================================
+-- PLANE-LOD DEBUG MARKER
+--
+-- The orange marker now uses the exact measured tree height.
+-- Its center is positioned using the tree's bounding-box center.
+--==============================================================
+
+createPlaneDebugMarker = function(data)
+
+	if not PLANE_DEBUG_MARKER_ENABLED
+		or not PLANE_MARKERS_VISIBLE
+		or data.PlaneDebugMarker then
+
+		return
+
 	end
 
 	if not data.RootPart or not data.RootPart.Parent then
@@ -800,39 +858,45 @@ local function createBillboardDebugMarker(data)
 
 	local marker = Instance.new("Part")
 
-	marker.Name = "TreeLOD_BillboardDebugMarker"
+	marker.Name = "TreeLOD_PlaneDebugMarker"
+
 	marker.Anchored = true
+
 	marker.CanCollide = false
 	marker.CanTouch = false
 	marker.CanQuery = false
+
 	marker.CastShadow = false
+
 	marker.Material = Enum.Material.Neon
 	marker.Color = Color3.fromRGB(255, 140, 35)
 	marker.Transparency = 0.2
 
+	-- Marker height matches the tree it replaces.
 	marker.Size = Vector3.new(
 		1,
-		BILLBOARD_DEBUG_MARKER_HEIGHT,
+		math.max(data.TreeHeight, 0.1),
 		1
 	)
 
-	marker.CFrame = data.RootPart.CFrame * CFrame.new(
+	local markerCenter = data.RootPart.Position + Vector3.new(
 		0,
-		BILLBOARD_DEBUG_MARKER_HEIGHT / 2,
+		data.TreeBottomOffset + (data.TreeHeight / 2),
 		0
 	)
 
+	marker.CFrame = CFrame.new(markerCenter)
 	marker.Parent = workspace
 
-	data.BillboardDebugMarker = marker
+	data.PlaneDebugMarker = marker
 
 end
 
-local function removeBillboardDebugMarker(data)
+removePlaneDebugMarker = function(data)
 
-	if data.BillboardDebugMarker then
-		data.BillboardDebugMarker:Destroy()
-		data.BillboardDebugMarker = nil
+	if data.PlaneDebugMarker then
+		data.PlaneDebugMarker:Destroy()
+		data.PlaneDebugMarker = nil
 	end
 
 end
@@ -845,22 +909,23 @@ local function setTreeLOD(data, newLOD)
 
 	if newLOD == "Inactive2D" then
 
-		-- Create and enable billboard before hiding the 3D tree.
-		local success, billboard = pcall(function()
-			return createBillboard(data)
+		-- Create the replacement plane before hiding the original tree.
+		local success, plane = pcall(function()
+			return createTreePlane(data)
 		end)
 
-		if not success or not billboard then
+		if not success or not plane then
 
-			BillboardFailureCount += 1
+			if not data.PlaneFailed then
+				PlaneFailureCount += 1
+			end
 
-			data.BillboardFailed = true
+			data.PlaneFailed = true
+
+			removeTreePlane(data)
+			removePlaneDebugMarker(data)
 
 			setTree3DVisible(data, true)
-
-			if data.Billboard then
-				data.Billboard.Enabled = false
-			end
 
 			data.LOD = "Inactive3D"
 
@@ -868,11 +933,9 @@ local function setTreeLOD(data, newLOD)
 
 		end
 
-		billboard.Enabled = true
+		data.PlaneFailed = false
 
-		data.BillboardFailed = false
-
-		createBillboardDebugMarker(data)
+		createPlaneDebugMarker(data)
 
 		setTree3DVisible(data, false)
 
@@ -882,17 +945,13 @@ local function setTreeLOD(data, newLOD)
 
 	end
 
-	-- Restore 3D before disabling billboard.
-	removeBillboardDebugMarker(data)
-
+	-- Restore the original tree before removing its replacement plane.
 	setTree3DVisible(data, true)
 
-	if data.Billboard then
-		data.Billboard.Enabled = false
-	end
+	removeTreePlane(data)
+	removePlaneDebugMarker(data)
 
-	data.BillboardFailed = false
-
+	data.PlaneFailed = false
 	data.LOD = newLOD
 
 	return true
@@ -937,8 +996,7 @@ local function setupTree(model)
 	end
 
 	-- Find server-created AnimationController.
-	local controller =
-		model:FindFirstChildOfClass("AnimationController")
+	local controller = model:FindFirstChildOfClass("AnimationController")
 
 	if not controller then
 
@@ -955,8 +1013,7 @@ local function setupTree(model)
 	end
 
 	-- Find Animator.
-	local animator =
-		controller:FindFirstChildOfClass("Animator")
+	local animator = controller:FindFirstChildOfClass("Animator")
 
 	if not animator then
 		animator = controller:WaitForChild("Animator", 20)
@@ -982,7 +1039,6 @@ local function setupTree(model)
 
 	-- Cache model parts and their original local transparency.
 	local parts = {}
-
 	local originalTransparency = {}
 
 	for _, obj in ipairs(model:GetDescendants()) do
@@ -998,11 +1054,12 @@ local function setupTree(model)
 
 	end
 
-	-- Measure the actual model bounding box.
-	-- TreeHeight is stored in studs.
-	-- TreeBottomOffset aligns billboard bottom with tree base.
+	-- Measure the actual model bounds.
+	-- TreeBottomOffset is the distance from RootPart.Position
+	-- to the bottom of the tree's bounding box.
 	local treeHeight = 20
-	local treeBottomOffset = 10
+	local treeWidth = 10
+	local treeBottomOffset = 0
 
 	local boundsSuccess, boundsCFrame, boundsSize = pcall(function()
 		return model:GetBoundingBox()
@@ -1012,9 +1069,15 @@ local function setupTree(model)
 
 		treeHeight = math.max(boundsSize.Y, 1)
 
+		treeWidth = math.max(
+			boundsSize.X,
+			boundsSize.Z,
+			1
+		)
+
 		treeBottomOffset =
 			(boundsCFrame.Position.Y - root.Position.Y)
-			+ (treeHeight / 2)
+		- (treeHeight / 2)
 
 	else
 
@@ -1026,14 +1089,17 @@ local function setupTree(model)
 
 			treeHeight = math.max(extents.Y, 1)
 
-			treeBottomOffset = treeHeight / 2
+			treeWidth = math.max(
+				extents.X,
+				extents.Z,
+				1
+			)
+
+			treeBottomOffset = 0
 
 		end
 
 	end
-
-	-- Select billboard ONCE for this tree.
-	local selectedBillboard = chooseBillboardImage(model.Name)
 
 	-- Calculate cluster.
 	local clusterX, clusterZ =
@@ -1072,13 +1138,15 @@ local function setupTree(model)
 
 		TreeHeight = treeHeight,
 
+		TreeWidth = treeWidth,
+
 		TreeBottomOffset = treeBottomOffset,
 
-		BillboardImage = selectedBillboard,
+		Plane = nil,
 
-		Billboard = nil,
+		PlaneDebugMarker = nil,
 
-		BillboardFailed = false,
+		PlaneFailed = false,
 
 	}
 
@@ -1170,20 +1238,14 @@ local function resumeAnimation(data)
 	end
 
 	if not data.ActiveTrack then
-
-		data.Paused = false
-
 		return
-
 	end
 
 	local track = data.ActiveTrack
 
 	pcall(function()
 
-		track:AdjustSpeed(
-			data.SavedAnimationSpeed or 1
-		)
+		track:AdjustSpeed(data.SavedAnimationSpeed)
 
 		data.Paused = false
 
@@ -1195,23 +1257,13 @@ end
 -- PLAY RANDOM ANIMATION
 --==============================================================
 
-local playRandomAnimation
+local function playRandomAnimation(data)
 
-playRandomAnimation = function(data)
+	if not data or not data.Animator then
+		return
+	end
 
 	if not data.IsActive then
-		return
-	end
-
-	if data.Paused then
-		return
-	end
-
-	if not data.Model or not data.Model.Parent then
-		return
-	end
-
-	if not data.Animator or not data.Animator.Parent then
 		return
 	end
 
@@ -1219,102 +1271,105 @@ playRandomAnimation = function(data)
 		return
 	end
 
-	-- Choose random animation.
-	local animation = data.Animations[
-	math.random(1, #data.Animations)
-	]
-
-	-- Load animation.
-	local success, track = pcall(function()
-
-		return data.Animator:LoadAnimation(animation)
-
-	end)
-
-	if not success or not track then
-
-		warn(
-			"[TreeLOD] Failed to load:",
-			animation.AnimationId,
-			data.Model:GetFullName()
-		)
-
-		return
-
-	end
-
-	-- Unique playback token.
 	data.PlayToken += 1
 
 	local token = data.PlayToken
 
-	data.ActiveTrack = track
+	task.spawn(function()
 
-	track.Looped = false
+		while Running
+			and data.IsActive
+			and data.PlayToken == token do
 
-	local speed =
-		MIN_SPEED
-		+ math.random() * (MAX_SPEED - MIN_SPEED)
+			local animation =
+				data.Animations[math.random(1, #data.Animations)]
 
-	data.SavedAnimationSpeed = speed
+			local success, track = pcall(function()
 
-	track:AdjustSpeed(speed)
+				local loadedTrack =
+					data.Animator:LoadAnimation(animation)
 
-	track:Play(CROSSFADE_TIME)
+				loadedTrack.Looped = false
 
-	if DEBUG_FIRST_ANIMATION and not firstAnimationReported then
+				return loadedTrack
 
-		firstAnimationReported = true
+			end)
 
-		print(
-			"[TreeLOD] First animation started:",
-			data.Model:GetFullName(),
-			animation.AnimationId
-		)
+			if success and track then
 
-	end
+				data.ActiveTrack = track
 
-	-- When animation ends.
-	track.Stopped:Once(function()
+				local speed = MIN_SPEED
+					+ math.random()
+					* (MAX_SPEED - MIN_SPEED)
 
-		if data.ActiveTrack == track then
-			data.ActiveTrack = nil
+				data.SavedAnimationSpeed = speed
+
+				pcall(function()
+					track:AdjustSpeed(speed)
+					track:Play(CROSSFADE_TIME)
+				end)
+
+				if DEBUG_FIRST_ANIMATION and not firstAnimationReported then
+
+					firstAnimationReported = true
+
+					print(
+						"[TreeLOD] First tree animation started:",
+						data.Model.Name,
+						animation.AnimationId
+					)
+
+				end
+
+				local length = track.Length
+
+				if length <= 0 then
+					length = 3
+				end
+
+				local startTime = os.clock()
+
+				while Running
+					and data.IsActive
+					and data.PlayToken == token
+					and track.IsPlaying
+					and os.clock() - startTime < length + 1 do
+
+					task.wait(0.1)
+
+				end
+
+				if data.ActiveTrack == track then
+					data.ActiveTrack = nil
+				end
+
+				pcall(function()
+					track:Stop(CROSSFADE_TIME)
+					track:Destroy()
+				end)
+
+			else
+
+				warn(
+					"[TreeLOD] Failed to load animation for",
+					data.Model.Name,
+					track
+				)
+
+			end
+
+			if not data.IsActive or data.PlayToken ~= token then
+				break
+			end
+
+			task.wait(
+				MIN_DELAY
+					+ math.random()
+					* (MAX_DELAY - MIN_DELAY)
+			)
+
 		end
-
-		if data.PlayToken ~= token then
-			return
-		end
-
-		if not data.IsActive then
-			return
-		end
-
-		if data.Paused then
-			return
-		end
-
-		task.wait(
-			MIN_DELAY
-				+ math.random() * (MAX_DELAY - MIN_DELAY)
-		)
-
-		if not data.IsActive then
-			return
-		end
-
-		if data.Paused then
-			return
-		end
-
-		if data.PlayToken ~= token then
-			return
-		end
-
-		if not data.Model or not data.Model.Parent then
-			return
-		end
-
-		playRandomAnimation(data)
 
 	end)
 
@@ -1333,24 +1388,16 @@ local function removeTree(model)
 	local data = ManagedTrees[model]
 
 	if not data then
-
 		PendingTrees[model] = nil
-
 		return
-
 	end
 
 	stopAnimation(data)
 
-	removeBillboardDebugMarker(data)
+	removeTreePlane(data)
+	removePlaneDebugMarker(data)
 
-	-- Restore original visibility.
 	setTree3DVisible(data, true)
-
-	if data.Billboard then
-		data.Billboard:Destroy()
-		data.Billboard = nil
-	end
 
 	for _, animation in ipairs(data.Animations) do
 		animation:Destroy()
@@ -1363,33 +1410,27 @@ local function removeTree(model)
 		for i = #cluster, 1, -1 do
 
 			if cluster[i] == data then
-
 				table.remove(cluster, i)
-
 				break
-
 			end
 
 		end
 
 		if #cluster == 0 then
-
 			Clusters[data.ClusterKey] = nil
-
 			ClusterStates[data.ClusterKey] = nil
-
+			LockedClusterStates[data.ClusterKey] = nil
 		end
 
 	end
 
 	ManagedTrees[model] = nil
-
 	PendingTrees[model] = nil
 
 end
 
 --==============================================================
--- CLUSTER LOD CALCULATION
+-- LOD CALCULATION
 --==============================================================
 
 local function getClusterLOD(distance, previousLOD)
@@ -1400,10 +1441,10 @@ local function getClusterLOD(distance, previousLOD)
 	end
 
 	-- Hysteresis:
-	-- A billboard cluster returns to 3D at 360 studs.
+	-- A plane cluster returns to 3D at PLANE_RETURN_DISTANCE.
 	if previousLOD == "Inactive2D" then
 
-		if distance <= BILLBOARD_RETURN_DISTANCE then
+		if distance <= PLANE_RETURN_DISTANCE then
 			return "Inactive3D"
 		end
 
@@ -1411,8 +1452,8 @@ local function getClusterLOD(distance, previousLOD)
 
 	end
 
-	-- Enter billboard mode at 400 studs.
-	if distance >= BILLBOARD_DISTANCE then
+	-- Enter plane mode at PLANE_DISTANCE.
+	if distance >= PLANE_DISTANCE then
 		return "Inactive2D"
 	end
 
@@ -1428,13 +1469,10 @@ local function getClusterDebugColor(lod)
 
 	if lod == "Active3D" then
 		return Color3.fromRGB(40, 220, 90)
-
 	elseif lod == "Inactive3D" then
 		return Color3.fromRGB(55, 145, 255)
-
 	elseif lod == "Inactive2D" then
 		return Color3.fromRGB(255, 145, 35)
-
 	end
 
 	return DEBUG_COLOR
@@ -1446,7 +1484,6 @@ local function createDebugPart(key, lod)
 	local split = string.split(key, "_")
 
 	local x = tonumber(split[1])
-
 	local z = tonumber(split[2])
 
 	if not x or not z then
@@ -1460,9 +1497,7 @@ local function createDebugPart(key, lod)
 	part.Anchored = true
 
 	part.CanCollide = false
-
 	part.CanTouch = false
-
 	part.CanQuery = false
 
 	part.CastShadow = false
@@ -1493,7 +1528,7 @@ end
 
 local function updateDebugClusters(clusterStates)
 
-	if not DEBUG_MODE then
+	if not DEBUG_MODE or not ClusterVisualizationEnabled then
 		return
 	end
 
@@ -1502,7 +1537,6 @@ local function updateDebugClusters(clusterStates)
 		if clusterStates[key] == nil then
 
 			part:Destroy()
-
 			DebugParts[key] = nil
 
 		end
@@ -1527,7 +1561,7 @@ local function updateDebugClusters(clusterStates)
 
 end
 
-local function clearDebugClusters()
+clearDebugClusters = function()
 
 	for key, part in pairs(DebugParts) do
 
@@ -1578,22 +1612,16 @@ local function updateLOD()
 
 	-- Statistics.
 	local activeCount = 0
-
 	local playingCount = 0
-
 	local registeredCount = 0
 
 	local activeClusterCount = 0
-
 	local inactive3DCount = 0
-
-	local billboardClusterCount = 0
+	local planeClusterCount = 0
 
 	local pausedCount = 0
-
-	local billboardTreeCount = 0
-
-	local billboardFallbackCount = 0
+	local planeTreeCount = 0
+	local planeFallbackCount = 0
 
 	local clusterDebugStates = {}
 
@@ -1621,7 +1649,10 @@ local function updateLOD()
 
 		else
 
-			clusterLOD = getClusterLOD(distance, previousLOD)
+			clusterLOD = getClusterLOD(
+				distance,
+				previousLOD
+			)
 
 		end
 
@@ -1633,9 +1664,7 @@ local function updateLOD()
 		local cameraVisible = true
 
 		if clusterLOD == "Active3D" and camera then
-
 			cameraVisible = isClusterOnScreen(clusterKey)
-
 		end
 
 		-- Count cluster LOD levels.
@@ -1649,7 +1678,7 @@ local function updateLOD()
 
 		elseif clusterLOD == "Inactive2D" then
 
-			billboardClusterCount += 1
+			planeClusterCount += 1
 
 		end
 
@@ -1716,14 +1745,10 @@ local function updateLOD()
 
 				if clusterLOD == "Inactive2D" then
 
-					if data.Billboard and data.Billboard.Enabled then
-
-						billboardTreeCount += 1
-
+					if data.Plane and data.Plane.Parent then
+						planeTreeCount += 1
 					else
-
-						billboardFallbackCount += 1
-
+						planeFallbackCount += 1
 					end
 
 				end
@@ -1748,15 +1773,15 @@ local function updateLOD()
 
 	LastStats.Inactive3DClusters = inactive3DCount
 
-	LastStats.BillboardClusters = billboardClusterCount
+	LastStats.PlaneClusters = planeClusterCount
 
 	LastStats.PausedTrees = pausedCount
 
-	LastStats.BillboardTrees = billboardTreeCount
+	LastStats.PlaneTrees = planeTreeCount
 
-	LastStats.BillboardFallbacks = billboardFallbackCount
+	LastStats.PlaneFallbacks = planeFallbackCount
 
-	LastStats.BillboardFailures = BillboardFailureCount
+	LastStats.PlaneFailures = PlaneFailureCount
 
 	LastStats.Pending = 0
 
@@ -1775,9 +1800,7 @@ end
 local function scanForTrees()
 
 	local candidates = 0
-
 	local registered = 0
-
 	local missingRoot = 0
 
 	for _, obj in ipairs(TreesFolder:GetDescendants()) do
@@ -1896,7 +1919,7 @@ task.spawn(function()
 			scanForTrees()
 
 		print(
-			"[TREELOD DISCOVERY]",
+			"[TreeLOD DISCOVERY]",
 			"Candidates:", candidates,
 			"| Registered:", registered,
 			"| Missing RootPart:", missingRoot
@@ -1955,10 +1978,10 @@ task.spawn(function()
 
 				"| Active Clusters:", LastStats.ActiveClusters,
 				"| Inactive 3D:", LastStats.Inactive3DClusters,
-				"| Billboard Clusters:", LastStats.BillboardClusters,
+				"| Plane Clusters:", LastStats.PlaneClusters,
 
 				"| Paused Trees:", LastStats.PausedTrees,
-				"| Billboard Trees:", LastStats.BillboardTrees
+				"| Plane Trees:", LastStats.PlaneTrees
 			)
 
 		end
@@ -1979,14 +2002,12 @@ script.Destroying:Connect(function()
 
 		stopAnimation(data)
 
-		removeBillboardDebugMarker(data)
+		removePlaneDebugMarker(data)
 
 		-- Restore original 3D visibility.
 		setTree3DVisible(data, true)
 
-		if data.Billboard then
-			data.Billboard:Destroy()
-		end
+		removeTreePlane(data)
 
 		for _, animation in ipairs(data.Animations) do
 			animation:Destroy()
